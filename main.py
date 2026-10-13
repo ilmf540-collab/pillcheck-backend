@@ -129,3 +129,106 @@ def get_medicine(medicine_id: int):
             return row
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Statistika (faqat o'qish uchun, haqiqiy ma'lumotdan hisoblanadi)
+# ---------------------------------------------------------------------------
+
+CATEGORY_RULES = [
+    ("Og'riq va yallig'lanish", ["og'riq", "isitma", "yallig", "spazm"]),
+    ("Antibiotik va virusga qarshi", ["antibiotik", "antibakterial", "virus"]),
+    ("Oshqozon-ichak", ["oshqozon", "ichak", "ich ketish", "toksin", "suv balans"]),
+    ("Yurak va qon bosimi", ["yurak", "qon bosimi", "diuretik", "qon suyult"]),
+    ("Nafas yo'llari va allergiya", ["yo'tal", "burun", "allergiya"]),
+    ("Vitaminlar", ["vitamin"]),
+]
+
+
+def _norm(text: str) -> str:
+    """Turli apostrof belgilarini (‘ ’ ʻ ʼ `) oddiy ' ga keltiradi."""
+    t = (text or "").lower()
+    for ch in ("\u2018", "\u2019", "\u02bb", "\u02bc", "`"):
+        t = t.replace(ch, "'")
+    return t
+
+
+def category_name(usage: Optional[str]) -> str:
+    u = _norm(usage or "")
+    for name, keys in CATEGORY_RULES:
+        if any(k in u for k in keys):
+            return name
+    return "Boshqa"
+
+
+def _interaction_counts(cur, conn):
+    """Migratsiya qilinmagan bo'lsa ham xato bermasligi uchun ehtiyotkor hisoblaydi."""
+    try:
+        cur.execute(
+            "SELECT COUNT(*) AS total, "
+            "COUNT(*) FILTER (WHERE severity = 'danger') AS danger "
+            "FROM medicine_interactions"
+        )
+        r = cur.fetchone()
+        return int(r["total"]), int(r["danger"])
+    except Exception:
+        conn.rollback()
+        try:
+            cur.execute("SELECT COUNT(*) AS total FROM medicine_interactions")
+            return int(cur.fetchone()["total"]), 0
+        except Exception:
+            conn.rollback()
+            return 0, 0
+
+
+@app.get("/stats", tags=["Statistika"])
+def stats():
+    """Ma'lumotlar bazasi holati: nechta dori, nechtasi tekshirilgan, toifalar, to'liqlik."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status = 'verified') AS verified,
+                    COUNT(*) FILTER (WHERE active_ingredient IS NULL OR active_ingredient = '') AS missing_active,
+                    COUNT(*) FILTER (WHERE min_age IS NULL OR min_age = '') AS missing_age,
+                    COUNT(*) FILTER (WHERE duration IS NULL OR duration = '') AS missing_duration,
+                    COUNT(*) FILTER (WHERE contraindications IS NULL OR contraindications = '') AS missing_contra,
+                    MIN(price_min) AS price_min,
+                    MAX(price_max) AS price_max
+                FROM medicines
+                """
+            )
+            s = cur.fetchone()
+            cur.execute("SELECT usage FROM medicines")
+            counts: dict = {}
+            for row in cur.fetchall():
+                name = category_name(row["usage"])
+                counts[name] = counts.get(name, 0) + 1
+            inter_total, inter_danger = _interaction_counts(cur, conn)
+
+        total = int(s["total"])
+        categories = [
+            {"name": n, "count": c}
+            for n, c in sorted(counts.items(), key=lambda kv: -kv[1])
+        ]
+        return {
+            "total": total,
+            "verified": int(s["verified"]),
+            "draft": total - int(s["verified"]),
+            "interactions_total": inter_total,
+            "interactions_danger": inter_danger,
+            "price_min": s["price_min"],
+            "price_max": s["price_max"],
+            "categories": categories,
+            "missing": {
+                "active_ingredient": int(s["missing_active"]),
+                "min_age": int(s["missing_age"]),
+                "duration": int(s["missing_duration"]),
+                "contraindications": int(s["missing_contra"]),
+            },
+        }
+    finally:
+        conn.close()
